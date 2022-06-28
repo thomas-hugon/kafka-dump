@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::time::Duration;
 
+use anyhow::{anyhow, Context};
 use bincode::{Decode, Encode};
 use clap::{ArgEnum, Args, Subcommand};
 use clap::Parser;
@@ -11,7 +12,7 @@ use env_logger::Env;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{BorrowedHeaders, Headers, OwnedHeaders};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::util::Timeout;
@@ -104,7 +105,7 @@ enum PartitioningStrategy {
     DefaultHashKey,
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let args: Cli = Cli::parse();
     log::debug!("launched with args {:?}", args);
@@ -112,30 +113,69 @@ fn main() {
     match &args.command {
         Commands::Dump => consume(&args),
         Commands::Restore(restore_opts) => produce(&args, restore_opts.partitioning_strategy.clone()),
-    };
+    }
 }
 
-fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) {
-    let file = File::open(&cli.file).unwrap();
-    let file = snap::read::FrameDecoder::new(file);
-    let mut file = BufReader::new(file);
+fn consume(cli: &Cli) -> anyhow::Result<()> {
+    let consumer: BaseConsumer = client_config(&cli).with_context(|| "client configuration")?
+        .set("group.id", "_unused_group_id")
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create().with_context(|| "creating consumer")?;
+
+    let list = fetch_topic_partitions(&consumer, &cli.topic).with_context(|| "fetching topic partitions")?;
+    consumer.assign(&list).with_context(|| format!("assigning partitions {:?}", &list))?;
+
+    let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
+    let mut buffer = [0u8; 2 + u16::MAX as usize];
+    let mut count = 0;
+    loop {
+        let msg = consumer.poll(Timeout::After(Duration::from_secs(1)));
+        match msg {
+            None => {
+                log::info!("consumed {} messages", count);
+                return Ok(());
+            }
+            Some(msg) => {
+                let msg = msg?;
+                let message = SerMessage {
+                    partition: msg.partition(),
+                    key: msg.key().with_context(|| "missing key")?,
+                    value: msg.payload().with_context(|| "missing value")?,
+                    headers: match msg.headers() {
+                        None => vec![],
+                        Some(headers) => IterHeaders::new(headers).map(|(name, value)| SerHeader { name, value }).collect()
+                    },
+                };
+
+                let written = bincode::encode_into_slice(&message, &mut buffer[2..], bincode::config::standard())?;
+                buffer[0] = ((written & 0xFF00) >> 8) as u8;
+                buffer[1] = (written & 0x00FF) as u8;
+
+                file.write(&buffer[..(written + 2)])?;
+                count += 1;
+            }
+        }
+    }
+}
+
+fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Result<()> {
+    let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
     let mut size_buff = [0u8; 2];
     let mut data_buff = [0u8; u16::MAX as usize];
 
-
-    let producer: BaseProducer = client_config(&cli)
+    let producer: BaseProducer = client_config(&cli).with_context(|| "client configuration")?
         .set("linger.ms", "100")
         .set("request.required.acks", "all")
         .set("enable.idempotence", "true")
-        .create()
-        .expect("invalid producer config");
+        .create().with_context(|| "creating producer")?;
 
     let mut count = 0;
     while let Ok(()) = file.read_exact(&mut size_buff) {
         let size = ((size_buff[0] as u16) << 8 | (size_buff[1] as u16)) as usize;
-        file.read_exact(&mut data_buff[..size]).expect("read data");
+        file.read_exact(&mut data_buff[..size])?;
 
-        let (payload_obj, _): (DeserMessage, usize) = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard()).expect("zut");
+        let (payload_obj, _): (DeserMessage, usize) = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard())?;
 
         while let Err((err, _)) = send(&cli.topic, &producer, &payload_obj, &partitioning_strategy) {
             if let KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull) = err {
@@ -150,9 +190,20 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) {
     producer.flush(Duration::from_secs(1200));
 
     log::info!("produced {} messages", count);
+    return Ok(());
 }
 
-fn client_config(cli: &Cli) -> ClientConfig {
+fn fetch_topic_partitions(consumer: &BaseConsumer, topic: &str) -> anyhow::Result<TopicPartitionList> {
+    TopicPartitionList::from_topic_map(
+        &consumer.fetch_metadata(Some(topic), Timeout::After(Duration::from_secs(1)))?.topics().iter()
+            .flat_map(|tm| tm.partitions().iter().map(|pm| ((tm.name().to_string(), pm.id()), Offset::Beginning)))
+            .collect()
+    )
+        .map_err(|err| anyhow::Error::from(err))
+        .and_then(|list| (list.count() > 0).then(|| list).ok_or(anyhow!("no partitions found")))
+}
+
+fn client_config(cli: &Cli) -> Result<ClientConfig, anyhow::Error> {
     let mut client_config = ClientConfig::new();
     client_config
         .set_log_level(RDKafkaLogLevel::Debug)
@@ -162,11 +213,11 @@ fn client_config(cli: &Cli) -> ClientConfig {
         Protocol::Ssl => {
             client_config.set("security.protocol", "SSL")
                 .set("enable.ssl.certificate.verification", "false")
-                .set("ssl.keystore.location", cli.ssl_keystore_location.as_ref().expect("ssl-keystore-location is missing"))
-                .set("ssl.keystore.password", cli.ssl_keystore_password.as_ref().expect("ssl-keystore-password is missing"))
+                .set("ssl.keystore.location", cli.ssl_keystore_location.as_ref().with_context(|| "ssl-keystore-location is missing")?)
+                .set("ssl.keystore.password", cli.ssl_keystore_password.as_ref().with_context(|| "ssl-keystore-password is missing")?)
         }
     };
-    client_config
+    Ok(client_config)
 }
 
 fn send<'a>(topic: &'a str, producer: &BaseProducer, payload_obj: &'a DeserMessage, partitioning_strategy: &PartitioningStrategy) -> Result<(), (KafkaError, BaseRecord<'a, [u8], [u8]>)> {
@@ -189,66 +240,6 @@ fn send<'a>(topic: &'a str, producer: &BaseProducer, payload_obj: &'a DeserMessa
     };
 
     producer.send(record)
-}
-
-
-fn consume(cli: &Cli) {
-    let consumer: BaseConsumer = client_config(&cli)
-        .set("group.id", "_unused_group_id")
-        .set("enable.auto.commit", "false")
-        .set("auto.offset.reset", "earliest")
-        .create()
-        .expect("invalid consumer config");
-
-    let list = fetch_topic_partitions(&consumer, &cli.topic).expect("topicList");
-    if list.count() < 1 {
-        log::info!("no partitions");
-        return;
-    }
-    consumer
-        .assign(&list)
-        .expect("topic subscribe failed");
-
-    let file = File::create(&cli.file).unwrap();
-    let file = snap::write::FrameEncoder::new(file);
-    let mut file = BufWriter::new(file);
-    let mut buffer = [0u8; 2 + u16::MAX as usize];
-    let mut count = 0;
-    loop {
-        let msg = consumer.poll(Timeout::After(Duration::from_secs(1)));
-        match msg {
-            None => {
-                log::info!("consumed {} messages", count);
-                return;
-            }
-            Some(msg) => {
-                let msg = msg.expect("borrowedmessage");
-                let key = msg.key().unwrap();
-                let value = msg.payload().unwrap();
-                let partition = msg.partition();
-                let headers = match msg.headers() {
-                    None => vec![],
-                    Some(headers) => IterHeaders::new(headers).map(|(name, value)| SerHeader { name, value }).collect()
-                };
-                let message = SerMessage { partition, key, value, headers };
-
-                let written = bincode::encode_into_slice(&message, &mut buffer[2..], bincode::config::standard()).expect("TODO: panic message");
-                buffer[0] = ((written & 0xFF00) >> 8) as u8;
-                buffer[1] = (written & 0x00FF) as u8;
-
-                file.write(&buffer[..(written + 2)]).expect("fail write");
-                count += 1;
-            }
-        }
-    }
-}
-
-fn fetch_topic_partitions(consumer: &BaseConsumer, topic: &str) -> KafkaResult<TopicPartitionList> {
-    TopicPartitionList::from_topic_map(
-        &consumer.fetch_metadata(Some(topic), Timeout::After(Duration::from_secs(1)))?.topics().iter()
-            .flat_map(|tm| tm.partitions().iter().map(|pm| ((tm.name().to_string(), pm.id()), Offset::Beginning)))
-            .collect()
-    )
 }
 
 
