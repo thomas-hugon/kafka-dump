@@ -105,6 +105,9 @@ enum PartitioningStrategy {
     DefaultHashKey,
 }
 
+
+const BUFFER_SIZE: usize = 8_000_000 as usize;
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let args: Cli = Cli::parse();
@@ -127,7 +130,7 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
     consumer.assign(&list).with_context(|| format!("assigning partitions {:?}", &list))?;
 
     let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
-    let mut buffer = [0u8; 2 + u16::MAX as usize];
+    let mut buffer = [0u8; 4 + BUFFER_SIZE];
     let mut count = 0;
     loop {
         let msg = consumer.poll(Timeout::After(Duration::from_secs(1)));
@@ -137,7 +140,7 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
             Some(msg) => {
-                let msg = msg?;
+                let msg = msg.with_context(|| format!("while reading message {}", count + 1))?;
                 let message = SerMessage {
                     partition: msg.partition(),
                     key: msg.key().with_context(|| "missing key")?,
@@ -148,21 +151,25 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
                     },
                 };
 
-                let written = bincode::encode_into_slice(&message, &mut buffer[2..], bincode::config::standard())?;
-                buffer[0] = ((written & 0xFF00) >> 8) as u8;
-                buffer[1] = (written & 0x00FF) as u8;
+                let written = bincode::encode_into_slice(&message, &mut buffer[4..], bincode::config::standard())
+                    .with_context(|| format!("while encoding message key:{:?}, len:{}", String::from_utf8(message.key.to_vec()), message.value.len()))?;
+                buffer[0] = ((written as u32 & 0xFF000000) >> 24) as u8;
+                buffer[1] = ((written as u32 & 0x00FF0000) >> 16) as u8;
+                buffer[2] = ((written as u32 & 0x0000FF00) >> 8) as u8;
+                buffer[3] = (written as u32 & 0x000000FF) as u8;
 
-                file.write(&buffer[..(written + 2)])?;
+                file.write(&buffer[..(written + 4)]).with_context(|| format!("while reading message {}", count + 1))?;
                 count += 1;
             }
         }
     }
 }
 
+
 fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Result<()> {
     let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
-    let mut size_buff = [0u8; 2];
-    let mut data_buff = [0u8; u16::MAX as usize];
+    let mut size_buff = [0u8; 4];
+    let mut data_buff = [0u8; BUFFER_SIZE];
 
     let producer: BaseProducer = client_config(&cli).with_context(|| "client configuration")?
         .set("linger.ms", "100")
@@ -172,10 +179,13 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
 
     let mut count = 0;
     while let Ok(()) = file.read_exact(&mut size_buff) {
-        let size = ((size_buff[0] as u16) << 8 | (size_buff[1] as u16)) as usize;
+        let size = ((size_buff[0] as u32) << 24
+            | (size_buff[1] as u32) << 16
+            | (size_buff[2] as u32) << 8
+            | (size_buff[3] as u32)) as usize;
         file.read_exact(&mut data_buff[..size])?;
 
-        let (payload_obj, _): (DeserMessage, usize) = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard())?;
+        let (payload_obj, _): (DeserMessage, usize) = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard()).with_context(||format!("while deserializing, size:{}", size))?;
 
         while let Err((err, _)) = send(&cli.topic, &producer, &payload_obj, &partitioning_strategy) {
             if let KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull) = err {
@@ -183,6 +193,9 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
                 continue;
             }
             panic!("{}", err);
+        }
+        if count % 1000 == 0 {
+            producer.poll(Duration::from_secs(1));
         }
         count += 1;
     }
