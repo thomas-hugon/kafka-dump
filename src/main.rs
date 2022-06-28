@@ -9,6 +9,9 @@ use bincode::{Decode, Encode};
 use clap::{ArgEnum, Args, Subcommand};
 use clap::Parser;
 use env_logger::Env;
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -129,7 +132,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
     let list = fetch_topic_partitions(&consumer, &cli.topic).with_context(|| "fetching topic partitions")?;
     consumer.assign(&list).with_context(|| format!("assigning partitions {:?}", &list))?;
 
-    let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
+    //let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
+    let mut file = GzEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?, Compression::new(5));
     let mut buffer = [0u8; 4 + BUFFER_SIZE];
     let mut count = 0;
     loop {
@@ -167,7 +171,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
 
 
 fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Result<()> {
-    let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
+    //let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
+    let mut file = GzDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?);
     let mut size_buff = [0u8; 4];
     let mut data_buff = [0u8; BUFFER_SIZE];
 
