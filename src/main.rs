@@ -132,8 +132,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
     let list = fetch_topic_partitions(&consumer, &cli.topic).with_context(|| "fetching topic partitions")?;
     consumer.assign(&list).with_context(|| format!("assigning partitions {:?}", &list))?;
 
-    //let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
-    let mut file = GzEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?, Compression::new(5));
+    let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
+    //let mut file = GzEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?, Compression::new(5));
     let mut buffer = [0u8; 4 + BUFFER_SIZE];
     let mut count = 0;
     loop {
@@ -157,6 +157,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
 
                 let written = bincode::encode_into_slice(&message, &mut buffer[4..], bincode::config::standard())
                     .with_context(|| format!("while encoding message key:{:?}, len:{}", String::from_utf8(message.key.to_vec()), message.value.len()))?;
+
+
                 buffer[0] = ((written as u32 & 0xFF000000) >> 24) as u8;
                 buffer[1] = ((written as u32 & 0x00FF0000) >> 16) as u8;
                 buffer[2] = ((written as u32 & 0x0000FF00) >> 8) as u8;
@@ -171,8 +173,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
 
 
 fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Result<()> {
-    //let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
-    let mut file = GzDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?);
+    let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
+    //let mut file = GzDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?);
     let mut size_buff = [0u8; 4];
     let mut data_buff = [0u8; BUFFER_SIZE];
 
@@ -180,6 +182,7 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
         .set("linger.ms", "100")
         .set("request.required.acks", "all")
         .set("enable.idempotence", "true")
+        .set("message.max.bytes", "9000000")
         .create().with_context(|| "creating producer")?;
 
     let mut count = 0;
@@ -190,14 +193,17 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
             | (size_buff[3] as u32)) as usize;
         file.read_exact(&mut data_buff[..size])?;
 
-        let (payload_obj, _): (DeserMessage, usize) = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard()).with_context(||format!("while deserializing, size:{}", size))?;
+        let result = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard());
+        let (payload_obj, _): (DeserMessage, usize) = result
+            .with_context(||format!("while deserializing, size:{}, buff: {:?}, asStr: {:?}", size, &data_buff[..size], String::from_utf8_lossy(&data_buff[..size])))?;
 
         while let Err((err, _)) = send(&cli.topic, &producer, &payload_obj, &partitioning_strategy) {
             if let KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull) = err {
                 producer.poll(Duration::from_secs(5));
                 continue;
             }
-            panic!("{}", err);
+            return Err(anyhow!(err))
+                .with_context(|| format!("{:?}, {:?}, payload_len={}", String::from_utf8(payload_obj.value.clone()), String::from_utf8(payload_obj.key.clone()), payload_obj.value.len()));
         }
         if count % 1000 == 0 {
             producer.poll(Duration::from_secs(1));
@@ -225,6 +231,8 @@ fn client_config(cli: &Cli) -> Result<ClientConfig, anyhow::Error> {
     let mut client_config = ClientConfig::new();
     client_config
         .set_log_level(RDKafkaLogLevel::Debug)
+        .set("compression.codec", "lz4")
+        .set("compression.type", "lz4")
         .set("bootstrap.servers", &cli.brokers);
     match &cli.security_protocol {
         Protocol::Plaintext => client_config.set("security.protocol", "plaintext"),
