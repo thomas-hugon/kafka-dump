@@ -93,6 +93,8 @@ struct Restore {
 struct Dump {
     #[clap(long, short = 'g', value_parser)]
     group_id: Option<String>,
+    #[clap(long, short = 'a', value_parser, default_value = "false")]
+    append: bool,
 }
 
 #[derive(Clone, Debug, Subcommand, ArgEnum)]
@@ -110,12 +112,12 @@ fn main() -> anyhow::Result<()> {
     log::debug!("launched with args {:?}", args);
 
     match &args.command {
-        Commands::Dump (dump_opts) => consume(&args, dump_opts.group_id.clone()),
+        Commands::Dump (dump_opts) => consume(&args, dump_opts.group_id.clone(), dump_opts.append),
         Commands::Restore(restore_opts) => produce(&args, restore_opts.partitioning_strategy.clone()),
     }
 }
 
-fn consume(cli: &Cli, group_id: Option<String>) -> anyhow::Result<()> {
+fn consume(cli: &Cli, group_id: Option<String>, append: bool) -> anyhow::Result<()> {
     let consumer: BaseConsumer = client_config(&cli).with_context(|| "client configuration")?
         .set("group.id", group_id.clone().unwrap_or("_unused_group_id".to_string()))
         .set("enable.auto.commit", "false")
@@ -125,7 +127,13 @@ fn consume(cli: &Cli, group_id: Option<String>) -> anyhow::Result<()> {
     let list = fetch_topic_partitions(&consumer, &cli.topic).with_context(|| "fetching topic partitions")?;
     consumer.assign(&list).with_context(|| format!("assigning partitions {:?}", &list))?;
 
-    let file = File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file));
+    let mut file = File::options();
+    if append {
+        file.append(true).create(true)
+    } else{
+        file.write(true).create_new(true)
+    };
+    let file = file.open(&cli.file).with_context(|| format!("creating file {:?}", &cli.file));
     let mut file = BufWriter::new(snap::write::FrameEncoder::new(file?));
     //let mut file = GzEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?, Compression::new(5));
     let mut buffer = [0u8; 4 + BUFFER_SIZE];
@@ -175,7 +183,7 @@ fn consume(cli: &Cli, group_id: Option<String>) -> anyhow::Result<()> {
 
 
 fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Result<()> {
-    let file = File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?;
+    let file = File::options().read(true).open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?;
     let mut file = BufReader::new(snap::read::FrameDecoder::new(file));
     //let mut file = GzDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?);
     let mut size_buff = [0u8; 4];
