@@ -9,43 +9,29 @@ use bincode::{Decode, Encode};
 use clap::{ArgEnum, Args, Subcommand};
 use clap::Parser;
 use env_logger::Env;
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
+// use flate2::Compression;
+// use flate2::read::GzDecoder;
+// use flate2::write::GzEncoder;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use rdkafka::config::RDKafkaLogLevel;
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{BorrowedHeaders, Headers, OwnedHeaders};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use rdkafka::util::Timeout;
 
-#[derive(Debug, Encode)]
-struct SerHeader<'a> {
-    name: &'a str,
-    value: &'a [u8],
-}
-
-#[derive(Debug, Encode)]
-struct SerMessage<'a> {
-    partition: i32,
-    key: &'a [u8],
-    value: &'a [u8],
-    headers: Vec<SerHeader<'a>>,
-}
-
-#[derive(Debug, Decode)]
-struct DeserHeader {
+#[derive(Debug, Encode, Decode)]
+struct SerHeader {
     name: String,
     value: Vec<u8>,
 }
 
-#[derive(Debug, Decode)]
-struct DeserMessage {
+#[derive(Debug, Encode, Decode)]
+struct SerMessage {
     partition: i32,
-    key: Vec<u8>,
-    value: Vec<u8>,
-    headers: Vec<DeserHeader>,
+    key: Option<Vec<u8>>,
+    value: Option<Vec<u8>>,
+    headers: Vec<SerHeader>,
 }
 
 #[derive(Parser, Debug)]
@@ -90,7 +76,7 @@ enum Protocol {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Dump topic to file
-    Dump,
+    Dump(Dump),
     /// Restore file to topic
     Restore(Restore),
 }
@@ -100,6 +86,13 @@ enum Commands {
 struct Restore {
     #[clap(long, short = 'p', arg_enum, value_parser, default_value = "default-hash-key")]
     partitioning_strategy: PartitioningStrategy,
+}
+
+#[derive(Debug, Args)]
+#[clap(args_conflicts_with_subcommands = true)]
+struct Dump {
+    #[clap(long, short = 'g', value_parser)]
+    group_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Subcommand, ArgEnum)]
@@ -117,14 +110,14 @@ fn main() -> anyhow::Result<()> {
     log::debug!("launched with args {:?}", args);
 
     match &args.command {
-        Commands::Dump => consume(&args),
+        Commands::Dump (dump_opts) => consume(&args, dump_opts.group_id.clone()),
         Commands::Restore(restore_opts) => produce(&args, restore_opts.partitioning_strategy.clone()),
     }
 }
 
-fn consume(cli: &Cli) -> anyhow::Result<()> {
+fn consume(cli: &Cli, group_id: Option<String>) -> anyhow::Result<()> {
     let consumer: BaseConsumer = client_config(&cli).with_context(|| "client configuration")?
-        .set("group.id", "_unused_group_id")
+        .set("group.id", group_id.clone().unwrap_or("_unused_group_id".to_string()))
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .create().with_context(|| "creating consumer")?;
@@ -132,7 +125,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
     let list = fetch_topic_partitions(&consumer, &cli.topic).with_context(|| "fetching topic partitions")?;
     consumer.assign(&list).with_context(|| format!("assigning partitions {:?}", &list))?;
 
-    let mut file = BufWriter::new(snap::write::FrameEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?));
+    let file = File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file));
+    let mut file = BufWriter::new(snap::write::FrameEncoder::new(file?));
     //let mut file = GzEncoder::new(File::create(&cli.file).with_context(|| format!("creating file {:?}", &cli.file))?, Compression::new(5));
     let mut buffer = [0u8; 4 + BUFFER_SIZE];
     let mut count = 0;
@@ -141,22 +135,30 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
         match msg {
             None => {
                 log::info!("consumed {} messages", count);
-                return Ok(());
+                if count > 0 && group_id.is_some() {
+                    return consumer.commit_consumer_state( CommitMode::Sync).with_context(|| "while committing last message")
+                }
+                return Ok(())
             }
             Some(msg) => {
                 let msg = msg.with_context(|| format!("while reading message {}", count + 1))?;
                 let message = SerMessage {
                     partition: msg.partition(),
-                    key: msg.key().with_context(|| "missing key")?,
-                    value: msg.payload().with_context(|| "missing value")?,
+                    key: msg.key().map(|o| o.to_vec()),
+                    value: msg.payload().map(|o| o.to_vec()),
                     headers: match msg.headers() {
                         None => vec![],
-                        Some(headers) => IterHeaders::new(headers).map(|(name, value)| SerHeader { name, value }).collect()
+                        Some(headers) => IterHeaders::new(headers)
+                            .map(|(name, value)| SerHeader { name: name.to_string(), value: value.to_vec() })
+                            .collect()
                     },
                 };
 
                 let written = bincode::encode_into_slice(&message, &mut buffer[4..], bincode::config::standard())
-                    .with_context(|| format!("while encoding message key:{:?}, len:{}", String::from_utf8(message.key.to_vec()), message.value.len()))?;
+                    .with_context(|| format!("while encoding message key:{:?}, len:{:?}",
+                                             message.key.map(|k| String::from_utf8(k)),
+                                             message.value.map(|v| v.len())
+                    ))?;
 
 
                 buffer[0] = ((written as u32 & 0xFF000000) >> 24) as u8;
@@ -164,7 +166,7 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
                 buffer[2] = ((written as u32 & 0x0000FF00) >> 8) as u8;
                 buffer[3] = (written as u32 & 0x000000FF) as u8;
 
-                file.write(&buffer[..(written + 4)]).with_context(|| format!("while reading message {}", count + 1))?;
+                file.write(&buffer[..(written + 4)]).with_context(|| format!("while writing message {} into file", count + 1))?;
                 count += 1;
             }
         }
@@ -173,7 +175,8 @@ fn consume(cli: &Cli) -> anyhow::Result<()> {
 
 
 fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Result<()> {
-    let mut file = BufReader::new(snap::read::FrameDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?));
+    let file = File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?;
+    let mut file = BufReader::new(snap::read::FrameDecoder::new(file));
     //let mut file = GzDecoder::new(File::open(&cli.file).with_context(|| format!("opening file {:?}", &cli.file))?);
     let mut size_buff = [0u8; 4];
     let mut data_buff = [0u8; BUFFER_SIZE];
@@ -183,6 +186,8 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
         .set("request.required.acks", "all")
         .set("enable.idempotence", "true")
         .set("message.max.bytes", "9000000")
+        .set("compression.type", "lz4")
+        .set("compression.codec", "lz4")
         .create().with_context(|| "creating producer")?;
 
     let mut count = 0;
@@ -194,8 +199,12 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
         file.read_exact(&mut data_buff[..size])?;
 
         let result = bincode::decode_from_slice(&data_buff[..size], bincode::config::standard());
-        let (payload_obj, _): (DeserMessage, usize) = result
-            .with_context(||format!("while deserializing, size:{}, buff: {:?}, asStr: {:?}", size, &data_buff[..size], String::from_utf8_lossy(&data_buff[..size])))?;
+        let (payload_obj, _): (SerMessage, usize) = result
+            .with_context(|| format!("while deserializing, size:{}, buff: {:?}, asStr: {:?}",
+                                     size,
+                                     &data_buff[..size],
+                                     String::from_utf8_lossy(&data_buff[..size])
+            ))?;
 
         while let Err((err, _)) = send(&cli.topic, &producer, &payload_obj, &partitioning_strategy) {
             if let KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull) = err {
@@ -203,7 +212,11 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
                 continue;
             }
             return Err(anyhow!(err))
-                .with_context(|| format!("{:?}, {:?}, payload_len={}", String::from_utf8(payload_obj.value.clone()), String::from_utf8(payload_obj.key.clone()), payload_obj.value.len()));
+                .with_context(|| format!("{:?}, {:?}, payload_len={:?}",
+                                         payload_obj.value.as_ref().map(|v| String::from_utf8_lossy(v)),
+                                         payload_obj.key.as_ref().map(|k| String::from_utf8_lossy(k)),
+                                         payload_obj.value.as_ref().map(|v| v.len())
+                ));
         }
         if count % 1000 == 0 {
             producer.poll(Duration::from_secs(1));
@@ -220,7 +233,7 @@ fn produce(cli: &Cli, partitioning_strategy: PartitioningStrategy) -> anyhow::Re
 fn fetch_topic_partitions(consumer: &BaseConsumer, topic: &str) -> anyhow::Result<TopicPartitionList> {
     TopicPartitionList::from_topic_map(
         &consumer.fetch_metadata(Some(topic), Timeout::After(Duration::from_secs(1)))?.topics().iter()
-            .flat_map(|tm| tm.partitions().iter().map(|pm| ((tm.name().to_string(), pm.id()), Offset::Beginning)))
+            .flat_map(|tm| tm.partitions().iter().map(|pm| ((tm.name().to_string(), pm.id()), Offset::Stored)))
             .collect()
     )
         .map_err(|err| anyhow::Error::from(err))
@@ -231,8 +244,6 @@ fn client_config(cli: &Cli) -> Result<ClientConfig, anyhow::Error> {
     let mut client_config = ClientConfig::new();
     client_config
         .set_log_level(RDKafkaLogLevel::Debug)
-        .set("compression.codec", "lz4")
-        .set("compression.type", "lz4")
         .set("bootstrap.servers", &cli.brokers);
     match &cli.security_protocol {
         Protocol::Plaintext => client_config.set("security.protocol", "plaintext"),
@@ -246,26 +257,28 @@ fn client_config(cli: &Cli) -> Result<ClientConfig, anyhow::Error> {
     Ok(client_config)
 }
 
-fn send<'a>(topic: &'a str, producer: &BaseProducer, payload_obj: &'a DeserMessage, partitioning_strategy: &PartitioningStrategy) -> Result<(), (KafkaError, BaseRecord<'a, [u8], [u8]>)> {
+fn send<'a>(topic: &'a str, producer: &BaseProducer, payload_obj: &'a SerMessage, partitioning_strategy: &PartitioningStrategy) -> Result<(), (KafkaError, BaseRecord<'a, [u8], [u8]>)> {
     let mut headers = OwnedHeaders::new();
     let vec = &payload_obj.headers[..];
     for header in vec.iter() {
         headers = headers.add(&header.name, &header.value);
     }
 
-    let partition = payload_obj.partition;
-
-    let record = BaseRecord::to(topic)
-        .key(&payload_obj.key[..])
-        .payload(&payload_obj.value[..])
-        .headers(headers);
-
-    let record = match partitioning_strategy {
-        PartitioningStrategy::OriginPartition => record.partition(partition),
-        PartitioningStrategy::DefaultHashKey => record
+    let record = BaseRecord::to(topic);
+    let record = match &payload_obj.key {
+        None => record,
+        Some(v) => record.key(&v[..])
     };
+    let record = match &payload_obj.value {
+        None => record,
+        Some(v) => record.payload(&v[..])
+    };
+    let record = record.headers(headers);
 
-    producer.send(record)
+    producer.send(match partitioning_strategy {
+        PartitioningStrategy::OriginPartition => record.partition(payload_obj.partition),
+        PartitioningStrategy::DefaultHashKey => record
+    })
 }
 
 
