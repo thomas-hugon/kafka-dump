@@ -1,1 +1,1 @@
-docker build -t "kafka-dmp:latest" . && container_id=$(docker create "kafka-dmp:latest") && docker cp "${container_id}:/kafka-dmp" "./kafka-dmp"
+docker build -t "kafka-dump:latest" . && container_id=$(docker create "kafka-dump:latest") && docker cp "${container_id}:/kafka-dump" "./kafka-dump"

@@ -1,5 +1,5 @@
 [package]
-name = "kafka-dmp"
+name = "kafka-dump"
 version = "1.0.0"
 edition = "2021"
 authors = ["Babar"]
@@ -21,5 +21,5 @@ codegen-units = 1
 panic = "abort"
 
 [[bin]]
-name = "kafka-dmp"
+name = "kafka-dump"
 path = "src/main.rs"
